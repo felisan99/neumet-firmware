@@ -4,6 +4,7 @@
 #include <BLEUtils.h>
 #include <BLE2902.h>
 #include <driver/gpio.h>
+#include <esp_bt.h>
 
 // ESP32-C3 Super Mini Pines
 #define PIN_BAT_LVL 0
@@ -310,6 +311,10 @@ void setup()
   pAdvertising->addServiceUUID(SERVICE_UUID);
   pAdvertising->setScanResponse(false);
   pAdvertising->setMinPreferred(0x0);  
+  // Reducir potencia BLE para ahorrar energía (~-3dBm, suficiente para corta distancia)
+  esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_DEFAULT, ESP_PWR_LVL_N3);
+  esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_ADV, ESP_PWR_LVL_N3);
+
   BLEDevice::startAdvertising();
   DEBUG_PRINTLN("Esperando conexión...");
 
