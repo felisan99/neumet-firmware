@@ -6,11 +6,13 @@
 #include <driver/gpio.h>
 
 // ESP32-C3 Super Mini Pines
-#define PIN_DATA 4 
-#define PIN_CLOCK 5
-#define PIN_SLEEP 3
+#define PIN_BAT_LVL 0
+#define PIN_LED   1
 #define PIN_BOTON 2
-#define PIN_LED   7
+// PIN_SLEEP (GPIO 3) deprecado - ya no se usa
+#define PIN_CLOCK 4
+#define PIN_TARE 20
+#define PIN_DATA 21 
 
 // Debug: cambiar a 1 para activar prints por Serial
 #define DEBUG_MODE 0
@@ -39,11 +41,49 @@ volatile unsigned long lastClock = 0;
 volatile bool frameReady = false;
 volatile unsigned long interruptCount = 0;
 
+float batteryVoltage = 0.0f;
+int batteryPercent = 0;
+unsigned long lastBatteryReadMs = 0;
+
 float lastDecodedValue = 0;
 bool hasValidValue = false;
 
 const int TOTAL_BITS = 24;
 const unsigned long GAP_THRESHOLD = 30000; // 30 ms en microsegundos
+const unsigned long BATTERY_READ_INTERVAL_MS = 5000;
+const unsigned long LONG_PRESS_MS = 5000;
+const unsigned long INACTIVITY_TIMEOUT_MS = 300000; // 5 minutos
+const unsigned long TARE_PULSE_MS = 500;
+
+unsigned long lastActivityMs = 0;
+
+// Ajustes de lectura ADC de bateria.
+// Si tu placa usa divisor resistivo para BAT_LVL, ajusta BATTERY_DIVIDER_RATIO.
+const float ADC_REFERENCE_VOLTAGE = 3.3f;
+const int ADC_MAX_READING = 4095;
+const int BATTERY_SAMPLES = 16;
+const float BATTERY_DIVIDER_RATIO = 2.0f;
+
+struct BatteryPoint {
+  float voltage;
+  int percent;
+};
+
+// Curva base aproximada para celda Li-Ion 18650 en reposo (sin carga fuerte).
+const BatteryPoint BATTERY_CURVE[] = {
+  {4.20f, 100},
+  {4.10f, 90},
+  {4.00f, 80},
+  {3.92f, 70},
+  {3.85f, 60},
+  {3.79f, 50},
+  {3.73f, 40},
+  {3.68f, 30},
+  {3.62f, 20},
+  {3.55f, 10},
+  {3.30f, 0}
+};
+const int BATTERY_CURVE_SIZE = sizeof(BATTERY_CURVE) / sizeof(BATTERY_CURVE[0]);
 
 class MyServerCallbacks: public BLEServerCallbacks {
     void onConnect(BLEServer* pServer) {
@@ -56,6 +96,60 @@ class MyServerCallbacks: public BLEServerCallbacks {
       DEBUG_PRINTLN("Dispositivo BLE desconectado");
     }
 };
+
+void setAwakeState(bool awake)
+{
+  // LED encendido mientras el equipo esta despierto.
+  digitalWrite(PIN_LED, awake ? HIGH : LOW);
+}
+
+int estimateBatteryPercent18650(float voltage)
+{
+  if (voltage >= BATTERY_CURVE[0].voltage) {
+    return BATTERY_CURVE[0].percent;
+  }
+  if (voltage <= BATTERY_CURVE[BATTERY_CURVE_SIZE - 1].voltage) {
+    return BATTERY_CURVE[BATTERY_CURVE_SIZE - 1].percent;
+  }
+
+  for (int i = 0; i < BATTERY_CURVE_SIZE - 1; i++) {
+    const BatteryPoint &high = BATTERY_CURVE[i];
+    const BatteryPoint &low = BATTERY_CURVE[i + 1];
+
+    if (voltage <= high.voltage && voltage >= low.voltage) {
+      float ratio = (voltage - low.voltage) / (high.voltage - low.voltage);
+      float percent = low.percent + ratio * (high.percent - low.percent);
+      return constrain((int)(percent + 0.5f), 0, 100);
+    }
+  }
+
+  return 0;
+}
+
+float readBatteryVoltage()
+{
+  uint32_t sum = 0;
+  for (int i = 0; i < BATTERY_SAMPLES; i++) {
+    sum += analogRead(PIN_BAT_LVL);
+    delay(2);
+  }
+
+  float avgRaw = (float)sum / BATTERY_SAMPLES;
+  float adcVoltage = (avgRaw / ADC_MAX_READING) * ADC_REFERENCE_VOLTAGE;
+  return adcVoltage * BATTERY_DIVIDER_RATIO;
+}
+
+void updateBatteryStatus()
+{
+  batteryVoltage = readBatteryVoltage();
+  batteryPercent = estimateBatteryPercent18650(batteryVoltage);
+
+  DEBUG_PRINT("Bateria: ");
+  DEBUG_PRINT(batteryVoltage, 2);
+  DEBUG_PRINT(" V (");
+  DEBUG_PRINT(batteryPercent);
+  DEBUG_PRINTLN("%)");
+}
 
 float decodeFrame(uint32_t frame)
 {
@@ -87,9 +181,9 @@ float decodeFrame(uint32_t frame)
 void sendDataOverBluetooth(float value)
 {
   if (deviceConnected) {
-      char buf[20];
-      // Convertir a string con signo y 2 decimales, simulando el formato anterior
-      snprintf(buf, sizeof(buf), "%+.2f\n", value); 
+      char buf[40];
+      // Formato: medida,bateria%
+      snprintf(buf, sizeof(buf), "%+.2f,%d\n", value, batteryPercent); 
       
       pTxCharacteristic->setValue((uint8_t*)buf, strlen(buf));
       pTxCharacteristic->notify();
@@ -98,6 +192,33 @@ void sendDataOverBluetooth(float value)
   } else {
       DEBUG_PRINTLN("Bluetooth no conectado.");
   }
+}
+
+void executeTare()
+{
+  DEBUG_PRINTLN("Ejecutando TARE...");
+  pinMode(PIN_TARE, OUTPUT);
+  digitalWrite(PIN_TARE, LOW);
+  delay(TARE_PULSE_MS);
+  digitalWrite(PIN_TARE, HIGH);
+  pinMode(PIN_TARE, INPUT_PULLUP);
+  DEBUG_PRINTLN("TARE completado.");
+}
+
+void enterDeepSleep()
+{
+  DEBUG_PRINTLN("Entrando en Deep Sleep...");
+#if DEBUG_MODE
+  Serial.flush();
+#endif
+
+  setAwakeState(false);
+
+  // Configurar PIN_BOTON para despertar en LOW
+  gpio_pullup_en((gpio_num_t)PIN_BOTON);
+  esp_deep_sleep_enable_gpio_wakeup(1ULL << PIN_BOTON, ESP_GPIO_WAKEUP_GPIO_LOW);
+
+  esp_deep_sleep_start();
 }
 
 void IRAM_ATTR handleClock()
@@ -140,21 +261,24 @@ void setup()
 
   // LED del botón encendido mientras el sistema está despierto
   pinMode(PIN_LED, OUTPUT);
-  digitalWrite(PIN_LED, HIGH);
+  setAwakeState(true);
+
+  analogReadResolution(12);
+  analogSetPinAttenuation(PIN_BAT_LVL, ADC_11db);
 
   // Configuración de pines (Pullup interno OK: calibre es 3V, ESP32 es 3.3V)
   pinMode(PIN_CLOCK, INPUT_PULLUP);
   pinMode(PIN_DATA, INPUT_PULLUP);
-  pinMode(PIN_SLEEP, INPUT_PULLUP); // Botón con pull-up interno
+  pinMode(PIN_TARE, INPUT_PULLUP);
+  pinMode(PIN_BOTON, INPUT_PULLUP);
 
   // Comprobar si despertamos de Deep Sleep
   if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_GPIO) {
     DEBUG_PRINTLN("¡Sistema despertado por botón!");
   }
 
-  // Configurar GPIO 3 para despertar al ESP32 cuando esté en LOW
-  esp_deep_sleep_enable_gpio_wakeup(1ULL << PIN_SLEEP, ESP_GPIO_WAKEUP_GPIO_LOW);
-  pinMode(PIN_BOTON, INPUT_PULLUP);
+  // Configurar PIN_BOTON para despertar del deep sleep
+  esp_deep_sleep_enable_gpio_wakeup(1ULL << PIN_BOTON, ESP_GPIO_WAKEUP_GPIO_LOW);
 
   attachInterrupt(digitalPinToInterrupt(PIN_CLOCK), handleClock, RISING);
   lastClock = micros();
@@ -188,38 +312,23 @@ void setup()
   pAdvertising->setMinPreferred(0x0);  
   BLEDevice::startAdvertising();
   DEBUG_PRINTLN("Esperando conexión...");
+
+  updateBatteryStatus();
+  lastBatteryReadMs = millis();
+  lastActivityMs = millis();
 }
 
 void loop()
 {
-  // Comprobación de botón Sleep/Wake
-  if (digitalRead(PIN_SLEEP) == LOW) {
-    delay(50); // Debounce
-    if (digitalRead(PIN_SLEEP) == LOW) {
-      DEBUG_PRINTLN("Botón Sleep presionado. Preparando para dormir...");
-      
-      // Esperar a que el usuario suelte el botón para evitar ciclos o despertares falsos
-      while(digitalRead(PIN_SLEEP) == LOW) {
-        delay(10);
-      }
-      delay(200); // Pequeño delay de seguridad eléctrica
+  if (millis() - lastBatteryReadMs >= BATTERY_READ_INTERVAL_MS) {
+    lastBatteryReadMs = millis();
+    updateBatteryStatus();
+  }
 
-      // Detener BLE (opcional pero recomendado)
-      // BLEDevice::deinit(); 
-      
-      DEBUG_PRINTLN("Entrando en Deep Sleep. Pulsa el mismo botón para despertar.");
-#if DEBUG_MODE
-      Serial.flush();
-#endif
-      
-      // Apagar LED antes de dormir
-      digitalWrite(PIN_LED, LOW);
-
-      // Asegurar que la resistencia pull-up se mantenga activa para el wakeup
-      gpio_pullup_en((gpio_num_t)PIN_SLEEP);
-      
-      esp_deep_sleep_start();
-    }
+  // Auto deep sleep por inactividad (5 minutos sin presionar botón)
+  if (millis() - lastActivityMs >= INACTIVITY_TIMEOUT_MS) {
+    DEBUG_PRINTLN("Inactividad detectada. Entrando en deep sleep...");
+    enterDeepSleep();
   }
 
   // Lógica de reconexión/publicidad
@@ -256,20 +365,32 @@ void loop()
     DEBUG_PRINTLN(lastDecodedValue);
   }
 
-  // Verificar botón de envío (INDEPENDIENTE de frameReady)
+  // Verificar botón: toque corto = enviar BLE, toque largo (>=5s) = tare
   if (digitalRead(PIN_BOTON) == LOW)
   {
     delay(50); // Debounce
     if (digitalRead(PIN_BOTON) == LOW) {
-      if (hasValidValue) {
-        sendDataOverBluetooth(lastDecodedValue);
-        DEBUG_PRINTLN("Dato enviado por Bluetooth.");
-      } else {
-        DEBUG_PRINTLN("Botón presionado, pero no hay datos del calibre aún.");
-      }
+      lastActivityMs = millis();
+      unsigned long pressStart = millis();
+
       // Esperar a que se suelte el botón
       while (digitalRead(PIN_BOTON) == LOW) {
         delay(10);
+      }
+
+      unsigned long pressDuration = millis() - pressStart;
+
+      if (pressDuration >= LONG_PRESS_MS) {
+        // Toque largo: ejecutar tare
+        executeTare();
+      } else {
+        // Toque corto: enviar medida + batería por BLE
+        if (hasValidValue) {
+          sendDataOverBluetooth(lastDecodedValue);
+          DEBUG_PRINTLN("Dato enviado por Bluetooth.");
+        } else {
+          DEBUG_PRINTLN("Botón presionado, pero no hay datos del calibre aún.");
+        }
       }
       delay(200); // Anti-rebote adicional
     }
