@@ -8,15 +8,15 @@
 
 // ESP32-C3 Super Mini Pines
 #define PIN_BAT_LVL 0
-#define PIN_LED   1
 #define PIN_BOTON 2
+#define PIN_LED   1
 // PIN_SLEEP (GPIO 3) deprecado - ya no se usa
 #define PIN_CLOCK 4
 #define PIN_TARE 20
 #define PIN_DATA 21 
 
 // Debug: cambiar a 1 para activar prints por Serial
-#define DEBUG_MODE 0
+#define DEBUG_MODE 1
 
 #if DEBUG_MODE
   #define DEBUG_PRINT(...) Serial.print(__VA_ARGS__)
@@ -51,8 +51,8 @@ bool hasValidValue = false;
 
 const int TOTAL_BITS = 24;
 const unsigned long GAP_THRESHOLD = 30000; // 30 ms en microsegundos
-const unsigned long BATTERY_READ_INTERVAL_MS = 5000;
-const unsigned long LONG_PRESS_MS = 5000;
+const unsigned long BATTERY_READ_INTERVAL_MS = 60000;
+const unsigned long LONG_PRESS_MS = 3000;
 const unsigned long INACTIVITY_TIMEOUT_MS = 300000; // 5 minutos
 const unsigned long TARE_PULSE_MS = 500;
 
@@ -258,9 +258,8 @@ void setup()
   // Desactivar JTAG en GPIO 4-7 para poder usarlos como GPIO normales
   gpio_reset_pin((gpio_num_t)PIN_CLOCK);
   gpio_reset_pin((gpio_num_t)PIN_DATA);
-  gpio_reset_pin((gpio_num_t)PIN_LED);
 
-  // LED del botón encendido mientras el sistema está despierto
+  // LED encendido desde el primer momento
   pinMode(PIN_LED, OUTPUT);
   setAwakeState(true);
 
@@ -277,9 +276,6 @@ void setup()
   if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_GPIO) {
     DEBUG_PRINTLN("¡Sistema despertado por botón!");
   }
-
-  // Configurar PIN_BOTON para despertar del deep sleep
-  esp_deep_sleep_enable_gpio_wakeup(1ULL << PIN_BOTON, ESP_GPIO_WAKEUP_GPIO_LOW);
 
   attachInterrupt(digitalPinToInterrupt(PIN_CLOCK), handleClock, RISING);
   lastClock = micros();
