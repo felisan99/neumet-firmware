@@ -64,6 +64,7 @@ bool buttonPressed = false;
 int lastRawButton = HIGH;
 unsigned long buttonChangeMs = 0;
 unsigned long pressStartMs = 0;
+bool tareTriggeredThisPress = false;
 
 // Estado no bloqueante del procedimiento de tare
 enum TareState { TARE_IDLE, TARE_BLINK, TARE_PULSE };
@@ -230,8 +231,8 @@ void updateTare()
       break;
 
     case TARE_BLINK:
-      // Parpadeo: 3 veces (0.5 s apagado / 0.5 s encendido) antes del pulso.
-      if (millis() - tareStepMs >= 500) {
+      // Parpadeo: 3 veces con 300 ms de intervalo para avisar que ya puede soltar.
+      if (millis() - tareStepMs >= 300) {
         tareStepMs = millis();
         tareBlinkSteps++;
         if (tareBlinkSteps >= 6) {
@@ -273,17 +274,23 @@ void updateButton()
       if (buttonPressed) {
         pressStartMs = millis();
         lastActivityMs = millis();
-      } else {
-        unsigned long pressDuration = millis() - pressStartMs;
-        if (pressDuration >= LONG_PRESS_MS) {
-          startTare();
-        } else if (hasValidValue) {
+        tareTriggeredThisPress = false;
+      } else if (!tareTriggeredThisPress) {
+        // Toque corto (soltado antes de los 3 s): enviar medida + bateria
+        if (hasValidValue) {
           sendDataOverBluetooth(lastDecodedValue);
           DEBUG_PRINTLN("Dato enviado por Bluetooth.");
         } else {
           DEBUG_PRINTLN("Boton presionado, pero no hay datos del calibre aun.");
         }
       }
+    }
+
+    // Al cumplir los 3 s manteniendo presionado: confirmar tare y avisar con parpadeo
+    if (buttonPressed && !tareTriggeredThisPress &&
+        millis() - pressStartMs >= LONG_PRESS_MS) {
+      tareTriggeredThisPress = true;
+      startTare();
     }
   }
 }
