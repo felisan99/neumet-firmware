@@ -11,9 +11,9 @@
 #define PIN_BOTON 2
 #define PIN_LED   1
 // PIN_SLEEP (GPIO 3) deprecado - ya no se usa
-#define PIN_CLOCK 4
-#define PIN_TARE 20
-#define PIN_DATA 21 
+#define PIN_TARE 4
+#define PIN_DATA 20
+#define PIN_CLOCK 21
 
 // Debug: cambiar a 1 para activar prints por Serial
 #define DEBUG_MODE 1
@@ -57,6 +57,24 @@ const unsigned long INACTIVITY_TIMEOUT_MS = 300000; // 5 minutos
 const unsigned long TARE_PULSE_MS = 500;
 
 unsigned long lastActivityMs = 0;
+
+// Estado no bloqueante del boton
+const unsigned long DEBOUNCE_MS = 50;
+bool buttonPressed = false;
+int lastRawButton = HIGH;
+unsigned long buttonChangeMs = 0;
+unsigned long pressStartMs = 0;
+
+// Estado no bloqueante del procedimiento de tare
+enum TareState { TARE_IDLE, TARE_BLINK, TARE_PULSE };
+TareState tareState = TARE_IDLE;
+unsigned long tareStepMs = 0;
+int tareBlinkSteps = 0;
+bool tareLedOn = false;
+
+// Re-anuncio BLE no bloqueante tras desconexion
+bool restartAdvertisingPending = false;
+unsigned long disconnectMs = 0;
 
 // Ajustes de lectura ADC de bateria.
 // Si tu placa usa divisor resistivo para BAT_LVL, ajusta BATTERY_DIVIDER_RATIO.
@@ -132,7 +150,6 @@ float readBatteryVoltage()
   uint32_t sum = 0;
   for (int i = 0; i < BATTERY_SAMPLES; i++) {
     sum += analogRead(PIN_BAT_LVL);
-    delay(2);
   }
 
   float avgRaw = (float)sum / BATTERY_SAMPLES;
@@ -195,15 +212,80 @@ void sendDataOverBluetooth(float value)
   }
 }
 
-void executeTare()
+void startTare()
 {
+  if (tareState != TARE_IDLE) return;
   DEBUG_PRINTLN("Ejecutando TARE...");
-  pinMode(PIN_TARE, OUTPUT);
-  digitalWrite(PIN_TARE, LOW);
-  delay(TARE_PULSE_MS);
-  digitalWrite(PIN_TARE, HIGH);
-  pinMode(PIN_TARE, INPUT_PULLUP);
-  DEBUG_PRINTLN("TARE completado.");
+  tareState = TARE_BLINK;
+  tareBlinkSteps = 0;
+  tareLedOn = false;
+  digitalWrite(PIN_LED, LOW);
+  tareStepMs = millis();
+}
+
+void updateTare()
+{
+  switch (tareState) {
+    case TARE_IDLE:
+      break;
+
+    case TARE_BLINK:
+      // Parpadeo: 3 veces (0.5 s apagado / 0.5 s encendido) antes del pulso.
+      if (millis() - tareStepMs >= 500) {
+        tareStepMs = millis();
+        tareBlinkSteps++;
+        if (tareBlinkSteps >= 6) {
+          digitalWrite(PIN_LED, HIGH);
+          pinMode(PIN_TARE, OUTPUT);
+          digitalWrite(PIN_TARE, LOW);
+          tareStepMs = millis();
+          tareState = TARE_PULSE;
+        } else {
+          tareLedOn = !tareLedOn;
+          digitalWrite(PIN_LED, tareLedOn ? HIGH : LOW);
+        }
+      }
+      break;
+
+    case TARE_PULSE:
+      if (millis() - tareStepMs >= TARE_PULSE_MS) {
+        digitalWrite(PIN_TARE, HIGH);
+        pinMode(PIN_TARE, INPUT_PULLUP);
+        tareState = TARE_IDLE;
+        DEBUG_PRINTLN("TARE completado.");
+      }
+      break;
+  }
+}
+
+void updateButton()
+{
+  int raw = digitalRead(PIN_BOTON);
+  if (raw != lastRawButton) {
+    lastRawButton = raw;
+    buttonChangeMs = millis();
+  }
+
+  if (millis() - buttonChangeMs >= DEBOUNCE_MS) {
+    bool nowPressed = (raw == LOW);
+    if (nowPressed != buttonPressed) {
+      buttonPressed = nowPressed;
+      if (buttonPressed) {
+        pressStartMs = millis();
+        lastActivityMs = millis();
+      } else {
+        unsigned long pressDuration = millis() - pressStartMs;
+        if (pressDuration >= LONG_PRESS_MS) {
+          startTare();
+        } else if (hasValidValue) {
+          sendDataOverBluetooth(lastDecodedValue);
+          DEBUG_PRINTLN("Dato enviado por Bluetooth.");
+        } else {
+          DEBUG_PRINTLN("Boton presionado, pero no hay datos del calibre aun.");
+        }
+      }
+    }
+  }
 }
 
 void enterDeepSleep()
@@ -214,6 +296,10 @@ void enterDeepSleep()
 #endif
 
   setAwakeState(false);
+
+  // Mantener el LED apagado durante el deep sleep (el pin se latchea en su nivel actual).
+  gpio_hold_en((gpio_num_t)PIN_LED);
+  gpio_deep_sleep_hold_en();
 
   // Configurar PIN_BOTON para despertar en LOW
   gpio_pullup_en((gpio_num_t)PIN_BOTON);
@@ -256,10 +342,12 @@ void setup()
   DEBUG_PRINTLN("Iniciando ESP32-C3 Super Mini BLE...");
 
   // Desactivar JTAG en GPIO 4-7 para poder usarlos como GPIO normales
+  gpio_reset_pin((gpio_num_t)PIN_TARE);
   gpio_reset_pin((gpio_num_t)PIN_CLOCK);
   gpio_reset_pin((gpio_num_t)PIN_DATA);
 
   // LED encendido desde el primer momento
+  gpio_hold_dis((gpio_num_t)PIN_LED);
   pinMode(PIN_LED, OUTPUT);
   setAwakeState(true);
 
@@ -279,10 +367,10 @@ void setup()
 
   attachInterrupt(digitalPinToInterrupt(PIN_CLOCK), handleClock, RISING);
   lastClock = micros();
-  DEBUG_PRINTLN("Interrupt configurada en PIN_CLOCK (GPIO 6) flanco RISING");
+  DEBUG_PRINTLN("Interrupt configurada en PIN_CLOCK (GPIO 21) flanco RISING");
 
   // Configuración BLE
-  BLEDevice::init("MPN+ BLE");
+  BLEDevice::init("NEUMET-MEDIDOR");
   pServer = BLEDevice::createServer();
   pServer->setCallbacks(new MyServerCallbacks());
 
@@ -306,7 +394,8 @@ void setup()
   BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
   pAdvertising->addServiceUUID(SERVICE_UUID);
   pAdvertising->setScanResponse(false);
-  pAdvertising->setMinPreferred(0x0);  
+  pAdvertising->setMinPreferred(160);
+  pAdvertising->setMaxPreferred(320);
   // Reducir potencia BLE para ahorrar energía (~-3dBm, suficiente para corta distancia)
   esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_DEFAULT, ESP_PWR_LVL_N3);
   esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_ADV, ESP_PWR_LVL_N3);
@@ -326,18 +415,22 @@ void loop()
     updateBatteryStatus();
   }
 
-  // Auto deep sleep por inactividad (5 minutos sin presionar botón)
-  if (millis() - lastActivityMs >= INACTIVITY_TIMEOUT_MS) {
+  // Auto deep sleep por inactividad (5 minutos), salvo si hay un tare en curso
+  if (tareState == TARE_IDLE && millis() - lastActivityMs >= INACTIVITY_TIMEOUT_MS) {
     DEBUG_PRINTLN("Inactividad detectada. Entrando en deep sleep...");
     enterDeepSleep();
   }
 
-  // Lógica de reconexión/publicidad
+  // Lógica de reconexión/publicidad (no bloqueante)
   if (!deviceConnected && oldDeviceConnected) {
-      delay(500); 
-      pServer->startAdvertising(); 
-      DEBUG_PRINTLN("Reiniciando publicidad BLE...");
+      disconnectMs = millis();
+      restartAdvertisingPending = true;
       oldDeviceConnected = deviceConnected;
+  }
+  if (restartAdvertisingPending && millis() - disconnectMs >= 500) {
+      pServer->startAdvertising();
+      restartAdvertisingPending = false;
+      DEBUG_PRINTLN("Reiniciando publicidad BLE...");
   }
   if (deviceConnected && !oldDeviceConnected) {
       oldDeviceConnected = deviceConnected;
@@ -366,36 +459,9 @@ void loop()
     DEBUG_PRINTLN(lastDecodedValue);
   }
 
-  // Verificar botón: toque corto = enviar BLE, toque largo (>=5s) = tare
-  if (digitalRead(PIN_BOTON) == LOW)
-  {
-    delay(50); // Debounce
-    if (digitalRead(PIN_BOTON) == LOW) {
-      lastActivityMs = millis();
-      unsigned long pressStart = millis();
-
-      // Esperar a que se suelte el botón
-      while (digitalRead(PIN_BOTON) == LOW) {
-        delay(10);
-      }
-
-      unsigned long pressDuration = millis() - pressStart;
-
-      if (pressDuration >= LONG_PRESS_MS) {
-        // Toque largo: ejecutar tare
-        executeTare();
-      } else {
-        // Toque corto: enviar medida + batería por BLE
-        if (hasValidValue) {
-          sendDataOverBluetooth(lastDecodedValue);
-          DEBUG_PRINTLN("Dato enviado por Bluetooth.");
-        } else {
-          DEBUG_PRINTLN("Botón presionado, pero no hay datos del calibre aún.");
-        }
-      }
-      delay(200); // Anti-rebote adicional
-    }
-  }
+  // Botón y procedimiento de tare (no bloqueantes)
+  updateButton();
+  updateTare();
 
 #if DEBUG_MODE
   // --- DEBUG: Estado cada 2 segundos ---
