@@ -5,6 +5,7 @@
 #include <BLE2902.h>
 #include <driver/gpio.h>
 #include <esp_bt.h>
+#include <esp_mac.h>
 
 // ESP32-C3 Super Mini Pines
 #define PIN_BAT_LVL 0
@@ -377,7 +378,11 @@ void setup()
   DEBUG_PRINTLN("Interrupt configurada en PIN_CLOCK (GPIO 21) flanco RISING");
 
   // Configuración BLE
-  BLEDevice::init("NEUMET-MEDIDOR");
+  uint8_t bleMac[6];
+  esp_read_mac(bleMac, ESP_MAC_BT);
+  char bleDeviceName[32];
+  snprintf(bleDeviceName, sizeof(bleDeviceName), "NEUMET-MEDIDOR-%02X%02X", bleMac[4], bleMac[5]);
+  BLEDevice::init(bleDeviceName);
   pServer = BLEDevice::createServer();
   pServer->setCallbacks(new MyServerCallbacks());
 
